@@ -41,6 +41,12 @@
 #include <node.h>
 #include <node_iterator.h>
 
+#ifndef _MSC_VER
+#define PACK( __Declaration__ ) __Declaration__ __attribute__((__packed__))
+#else
+#define PACK( __Declaration__ ) __pragma( pack(push, 1) ) __Declaration__ __pragma( pack(pop) )
+#endif
+
 /* Magic marker and size. */
 #define BPLIST_MAGIC            ((uint8_t*)"bplist")
 #define BPLIST_MAGIC_SIZE       6
@@ -48,14 +54,14 @@
 #define BPLIST_VERSION          ((uint8_t*)"00")
 #define BPLIST_VERSION_SIZE     2
 
-typedef struct __attribute__((packed)) {
+PACK(typedef struct {
     uint8_t unused[6];
     uint8_t offset_size;
     uint8_t ref_size;
     uint64_t num_objects;
     uint64_t root_object_index;
     uint64_t offset_table_offset;
-} bplist_trailer_t;
+}) bplist_trailer_t;
 
 enum
 {
@@ -86,6 +92,28 @@ union plist_uint_ptr
     uint64_t *u64ptr;
 };
 
+#ifdef _MSC_VER
+uint64_t get_unaligned_64(uint64_t *ptr)
+{
+	uint64_t temp;
+	memcpy(&temp, ptr, sizeof(temp));
+	return temp;
+}
+
+uint32_t get_unaligned_32(uint32_t *ptr)
+{
+	uint32_t temp;
+	memcpy(&temp, ptr, sizeof(temp));
+	return temp;
+}
+
+uint16_t get_unaligned_16(uint16_t *ptr)
+{
+	uint16_t temp;
+	memcpy(&temp, ptr, sizeof(temp));
+	return temp;
+}
+#else
 #define get_unaligned(ptr)			  \
   ({                                              \
     struct __attribute__((packed)) {		  \
@@ -93,7 +121,7 @@ union plist_uint_ptr
     } *__p = (void *) (ptr);			  \
     __p->__v;					  \
   })
-
+#endif
 
 #ifndef bswap16
 #define bswap16(x)   ((((x) & 0xFF00) >> 8) | (((x) & 0x00FF) << 8))
@@ -147,6 +175,20 @@ union plist_uint_ptr
 #define beNtoh(x,n) be64toh(x << ((8-n) << 3))
 #endif
 
+#ifdef _MSC_VER
+uint64_t UINT_TO_HOST(void* x, uint8_t n)
+{
+		union plist_uint_ptr __up;
+		// Adding to void* is a GCC extension, see http://gcc.gnu.org/onlinedocs/gcc-4.8.0/gcc/Pointer-Arith.html
+		__up.src = (n > 8) ? (char *)x + (n - 8) : x;
+		return (n >= 8 ? be64toh( get_unaligned_64(__up.u64ptr) ) :
+		(n == 4 ? be32toh( get_unaligned_32(__up.u32ptr) ) :
+		(n == 2 ? be16toh( get_unaligned_16(__up.u16ptr) ) :
+                (n == 1 ? *__up.u8ptr :
+		beNtoh( get_unaligned_64(__up.u64ptr), n)
+		))));
+}
+#else
 #define UINT_TO_HOST(x, n) \
 	({ \
 		union plist_uint_ptr __up; \
@@ -158,6 +200,7 @@ union plist_uint_ptr
 		beNtoh( get_unaligned(__up.u64ptr), n) \
 		)))); \
 	})
+#endif
 
 #define get_needed_bytes(x) \
 		( ((uint64_t)x) < (1ULL << 8) ? 1 : \
@@ -170,7 +213,8 @@ union plist_uint_ptr
 #if (defined(__LITTLE_ENDIAN__) \
      && !defined(__FLOAT_WORD_ORDER__)) \
  || (defined(__FLOAT_WORD_ORDER__) \
-     && __FLOAT_WORD_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+     && __FLOAT_WORD_ORDER__ == __ORDER_LITTLE_ENDIAN__) \
+ || (defined(_MSC_VER) && (REG_DWORD == REG_DWORD_LITTLE_ENDIAN))
 #define float_bswap64(x) bswap64(x)
 #define float_bswap32(x) bswap32(x)
 #else
@@ -252,7 +296,7 @@ static plist_t parse_uint_node(const char **bnode, uint8_t size)
         return NULL;
     };
 
-    data->intval = UINT_TO_HOST(*bnode, size);
+    data->intval = UINT_TO_HOST((void*)*bnode, size);
 
     (*bnode) += size;
     data->type = PLIST_UINT;
@@ -269,11 +313,20 @@ static plist_t parse_real_node(const char **bnode, uint8_t size)
     switch (size)
     {
     case sizeof(uint32_t):
-        *(uint32_t*)buf = float_bswap32(get_unaligned((uint32_t*)*bnode));
+		
+#ifdef _MSC_VER
+		*(uint32_t*)buf = float_bswap32(get_unaligned_32((uint32_t*)*bnode));
+#else
+		*(uint32_t*)buf = float_bswap32(get_unaligned((uint32_t*)*bnode));
+#endif
         data->realval = *(float *) buf;
         break;
     case sizeof(uint64_t):
-        *(uint64_t*)buf = float_bswap64(get_unaligned((uint64_t*)*bnode));
+#ifdef _MSC_VER
+        *(uint64_t*)buf = float_bswap64(get_unaligned_64((uint64_t*)*bnode));
+#else
+		*(uint64_t*)buf = float_bswap64(get_unaligned((uint64_t*)*bnode));
+#endif
         data->realval = *(double *) buf;
         break;
     default:
@@ -315,7 +368,7 @@ static plist_t parse_string_node(const char **bnode, uint64_t size)
     return node_create(NULL, data);
 }
 
-static char *plist_utf16be_to_utf8(uint16_t *unistr, long len, long *items_read, long *items_written)
+static char *plist_utf16_to_utf8(uint16_t *unistr, long len, long *items_read, long *items_written)
 {
 	if (!unistr || (len <= 0)) return NULL;
 	char *outbuf;
@@ -333,8 +386,7 @@ static char *plist_utf16be_to_utf8(uint16_t *unistr, long len, long *items_read,
 	}
 
 	while (i < len) {
-		wc = be16toh(get_unaligned(unistr + i));
-		i++;
+		wc = unistr[i++];
 		if (wc >= 0xD800 && wc <= 0xDBFF) {
 			if (!read_lead_surrogate) {
 				read_lead_surrogate = 1;
@@ -381,13 +433,28 @@ static char *plist_utf16be_to_utf8(uint16_t *unistr, long len, long *items_read,
 static plist_t parse_unicode_node(const char **bnode, uint64_t size)
 {
     plist_data_t data = plist_new_plist_data();
+    uint64_t i = 0;
+    uint16_t *unicodestr = NULL;
     char *tmpstr = NULL;
     long items_read = 0;
     long items_written = 0;
 
     data->type = PLIST_STRING;
+    unicodestr = (uint16_t*) malloc(sizeof(uint16_t) * size);
+    if (!unicodestr) {
+        plist_free_data(data);
+        PLIST_BIN_ERR("%s: Could not allocate %" PRIu64 " bytes\n", __func__, sizeof(uint16_t) * size);
+        return NULL;
+    }
+    for (i = 0; i < size; i++)
+#ifdef _MSC_VER
+		unicodestr[i] = be16toh(get_unaligned_16((uint16_t*)(*bnode + (i << 1))));
+#else
+        unicodestr[i] = be16toh(get_unaligned((uint16_t*)(*bnode+(i<<1))));
+#endif
 
-    tmpstr = plist_utf16be_to_utf8((uint16_t*)(*bnode), size, &items_read, &items_written);
+    tmpstr = plist_utf16_to_utf8(unicodestr, size, &items_read, &items_written);
+    free(unicodestr);
     if (!tmpstr) {
         plist_free_data(data);
         return NULL;
@@ -395,7 +462,7 @@ static plist_t parse_unicode_node(const char **bnode, uint64_t size)
     tmpstr[items_written] = '\0';
 
     data->type = PLIST_STRING;
-    data->strval = realloc(tmpstr, items_written+1);
+    data->strval = (char*)realloc(tmpstr, items_written+1);
     if (!data->strval)
         data->strval = tmpstr;
     data->length = items_written;
@@ -446,8 +513,8 @@ static plist_t parse_dict_node(struct bplist_data *bplist, const char** bnode, u
             return NULL;
         }
 
-        index1 = UINT_TO_HOST(index1_ptr, bplist->ref_size);
-        index2 = UINT_TO_HOST(index2_ptr, bplist->ref_size);
+        index1 = UINT_TO_HOST((void*)index1_ptr, bplist->ref_size);
+        index2 = UINT_TO_HOST((void*)index2_ptr, bplist->ref_size);
 
         if (index1 >= bplist->num_objects) {
             plist_free(node);
@@ -491,8 +558,8 @@ static plist_t parse_dict_node(struct bplist_data *bplist, const char** bnode, u
             return NULL;
         }
 
-        node_attach(node, key);
-        node_attach(node, val);
+        node_attach((node_t *)node, (node_t *)key);
+        node_attach((node_t *)node, (node_t *)val);
     }
 
     return node;
@@ -521,7 +588,7 @@ static plist_t parse_array_node(struct bplist_data *bplist, const char** bnode, 
             return NULL;
         }
 
-        index1 = UINT_TO_HOST(index1_ptr, bplist->ref_size);
+        index1 = UINT_TO_HOST((void*)index1_ptr, bplist->ref_size);
 
         if (index1 >= bplist->num_objects) {
             plist_free(node);
@@ -536,7 +603,7 @@ static plist_t parse_array_node(struct bplist_data *bplist, const char** bnode, 
             return NULL;
         }
 
-        node_attach(node, val);
+        node_attach((node_t *)node, (node_t *)val);
     }
 
     return node;
@@ -546,7 +613,7 @@ static plist_t parse_uid_node(const char **bnode, uint8_t size)
 {
     plist_data_t data = plist_new_plist_data();
     size = size + 1;
-    data->intval = UINT_TO_HOST(*bnode, size);
+    data->intval = UINT_TO_HOST((void*)*bnode, size);
     if (data->intval > UINT32_MAX) {
         PLIST_BIN_ERR("%s: value %" PRIu64 " too large for UID node (must be <= %u)\n", __func__, (uint64_t)data->intval, UINT32_MAX);
         free(data);
@@ -594,7 +661,7 @@ static plist_t parse_bin_node(struct bplist_data *bplist, const char** object)
                 PLIST_BIN_ERR("%s: size node data bytes for node type 0x%02x point outside of valid range\n", __func__, type);
                 return NULL;
             }
-            size = UINT_TO_HOST(*object, next_size);
+            size = UINT_TO_HOST((void*)*object, next_size);
             (*object) += next_size;
             break;
         }
@@ -733,7 +800,7 @@ static plist_t parse_bin_node_at_index(struct bplist_data *bplist, uint32_t node
         return NULL;
     }
 
-    ptr = bplist->data + UINT_TO_HOST(idx_ptr, bplist->offset_size);
+    ptr = bplist->data + UINT_TO_HOST((void*)idx_ptr, bplist->offset_size);
     /* make sure the node offset is in a sane range */
     if ((ptr < bplist->data) || (ptr >= bplist->offset_table)) {
         PLIST_BIN_ERR("offset for node index %u points outside of valid range\n", node_index);
@@ -1013,79 +1080,20 @@ static void write_data(bytearray_t * bplist, uint8_t * val, uint64_t size)
     write_raw_data(bplist, BPLIST_DATA, val, size);
 }
 
-static void write_string(bytearray_t * bplist, char *val, uint64_t size)
+static void write_string(bytearray_t * bplist, char *val)
 {
+    uint64_t size = strlen(val);
     write_raw_data(bplist, BPLIST_STRING, (uint8_t *) val, size);
 }
 
-static uint16_t *plist_utf8_to_utf16be(char *unistr, long size, long *items_read, long *items_written)
+static void write_unicode(bytearray_t * bplist, uint16_t * val, uint64_t size)
 {
-	uint16_t *outbuf;
-	int p = 0;
-	long i = 0;
-
-	unsigned char c0;
-	unsigned char c1;
-	unsigned char c2;
-	unsigned char c3;
-
-	uint32_t w;
-
-	outbuf = (uint16_t*)malloc(((size*2)+1)*sizeof(uint16_t));
-	if (!outbuf) {
-		PLIST_BIN_ERR("%s: Could not allocate %" PRIu64 " bytes\n", __func__, (uint64_t)((size*2)+1)*sizeof(uint16_t));
-		return NULL;
-	}
-
-	while (i < size) {
-		c0 = unistr[i];
-		c1 = (i < size-1) ? unistr[i+1] : 0;
-		c2 = (i < size-2) ? unistr[i+2] : 0;
-		c3 = (i < size-3) ? unistr[i+3] : 0;
-		if ((c0 >= 0xF0) && (i < size-3) && (c1 >= 0x80) && (c2 >= 0x80) && (c3 >= 0x80)) {
-			// 4 byte sequence.  Need to generate UTF-16 surrogate pair
-			w = ((((c0 & 7) << 18) + ((c1 & 0x3F) << 12) + ((c2 & 0x3F) << 6) + (c3 & 0x3F)) & 0x1FFFFF) - 0x010000;
-			outbuf[p++] = be16toh(0xD800 + (w >> 10));
-			outbuf[p++] = be16toh(0xDC00 + (w & 0x3FF));
-			i+=4;
-		} else if ((c0 >= 0xE0) && (i < size-2) && (c1 >= 0x80) && (c2 >= 0x80)) {
-			// 3 byte sequence
-			outbuf[p++] = be16toh(((c2 & 0x3F) + ((c1 & 3) << 6)) + (((c1 >> 2) & 15) << 8) + ((c0 & 15) << 12));
-			i+=3;
-		} else if ((c0 >= 0xC0) && (i < size-1) && (c1 >= 0x80)) {
-			// 2 byte sequence
-			outbuf[p++] = be16toh(((c1 & 0x3F) + ((c0 & 3) << 6)) + (((c0 >> 2) & 7) << 8));
-			i+=2;
-		} else if (c0 < 0x80) {
-			// 1 byte sequence
-			outbuf[p++] = be16toh(c0);
-			i+=1;
-		} else {
-			// invalid character
-			PLIST_BIN_ERR("%s: invalid utf8 sequence in string at index %lu\n", __func__, i);
-			break;
-		}
-	}
-	if (items_read) {
-		*items_read = i;
-	}
-	if (items_written) {
-		*items_written = p;
-	}
-	outbuf[p] = 0;
-
-	return outbuf;
-}
-
-static void write_unicode(bytearray_t * bplist, char *val, uint64_t size)
-{
-    long items_read = 0;
-    long items_written = 0;
-    uint16_t *unicodestr = NULL;
-
-    unicodestr = plist_utf8_to_utf16be(val, size, &items_read, &items_written);
-    write_raw_data(bplist, BPLIST_UNICODE, (uint8_t*)unicodestr, items_written);
-    free(unicodestr);
+    uint64_t i = 0;
+    uint16_t *buff = (uint16_t*)malloc(size << 1);
+    for (i = 0; i < size; i++)
+        buff[i] = be16toh(val[i]);
+    write_raw_data(bplist, BPLIST_UNICODE, (uint8_t*)buff, size);
+    free(buff);
 }
 
 static void write_array(bytearray_t * bplist, node_t* node, hashtable_t* ref_table, uint8_t ref_size)
@@ -1161,6 +1169,66 @@ static int is_ascii_string(char* s, int len)
   return ret;
 }
 
+static uint16_t *plist_utf8_to_utf16(char *unistr, long size, long *items_read, long *items_written)
+{
+	uint16_t *outbuf;
+	int p = 0;
+	long i = 0;
+
+	unsigned char c0;
+	unsigned char c1;
+	unsigned char c2;
+	unsigned char c3;
+
+	uint32_t w;
+
+	outbuf = (uint16_t*)malloc(((size*2)+1)*sizeof(uint16_t));
+	if (!outbuf) {
+		PLIST_BIN_ERR("%s: Could not allocate %" PRIu64 " bytes\n", __func__, (uint64_t)((size*2)+1)*sizeof(uint16_t));
+		return NULL;
+	}
+
+	while (i < size) {
+		c0 = unistr[i];
+		c1 = (i < size-1) ? unistr[i+1] : 0;
+		c2 = (i < size-2) ? unistr[i+2] : 0;
+		c3 = (i < size-3) ? unistr[i+3] : 0;
+		if ((c0 >= 0xF0) && (i < size-3) && (c1 >= 0x80) && (c2 >= 0x80) && (c3 >= 0x80)) {
+			// 4 byte sequence.  Need to generate UTF-16 surrogate pair
+			w = ((((c0 & 7) << 18) + ((c1 & 0x3F) << 12) + ((c2 & 0x3F) << 6) + (c3 & 0x3F)) & 0x1FFFFF) - 0x010000;
+			outbuf[p++] = 0xD800 + (w >> 10);
+			outbuf[p++] = 0xDC00 + (w & 0x3FF);
+			i+=4;
+		} else if ((c0 >= 0xE0) && (i < size-2) && (c1 >= 0x80) && (c2 >= 0x80)) {
+			// 3 byte sequence
+			outbuf[p++] = ((c2 & 0x3F) + ((c1 & 3) << 6)) + (((c1 >> 2) & 15) << 8) + ((c0 & 15) << 12);
+			i+=3;
+		} else if ((c0 >= 0xC0) && (i < size-1) && (c1 >= 0x80)) {
+			// 2 byte sequence
+			outbuf[p++] = ((c1 & 0x3F) + ((c0 & 3) << 6)) + (((c0 >> 2) & 7) << 8);
+			i+=2;
+		} else if (c0 < 0x80) {
+			// 1 byte sequence
+			outbuf[p++] = c0;
+			i+=1;
+		} else {
+			// invalid character
+			PLIST_BIN_ERR("%s: invalid utf8 sequence in string at index %lu\n", __func__, i);
+			break;
+		}
+	}
+	if (items_read) {
+		*items_read = i;
+	}
+	if (items_written) {
+		*items_written = p;
+	}
+	outbuf[p] = 0;
+
+	return outbuf;
+
+}
+
 PLIST_API void plist_to_bin(plist_t plist, char **plist_bin, uint32_t * length)
 {
     ptrarray_t* objects = NULL;
@@ -1176,6 +1244,11 @@ PLIST_API void plist_to_bin(plist_t plist, char **plist_bin, uint32_t * length)
     uint8_t *buff = NULL;
     uint64_t *offsets = NULL;
     bplist_trailer_t trailer;
+    //for string
+    long len = 0;
+    long items_read = 0;
+    long items_written = 0;
+    uint16_t *unicodestr = NULL;
     uint64_t objects_len = 0;
     uint64_t buff_len = 0;
 
@@ -1191,7 +1264,7 @@ PLIST_API void plist_to_bin(plist_t plist, char **plist_bin, uint32_t * length)
     //serialize plist
     ser_s.objects = objects;
     ser_s.ref_table = ref_table;
-    serialize_plist(plist, &ser_s);
+    serialize_plist((node_t*)plist, &ser_s);
 
     //now stream to output buffer
     offset_size = 0;			//unknown yet
@@ -1240,23 +1313,26 @@ PLIST_API void plist_to_bin(plist_t plist, char **plist_bin, uint32_t * length)
 
         case PLIST_KEY:
         case PLIST_STRING:
-            if ( is_ascii_string(data->strval, data->length) )
+            len = strlen(data->strval);
+            if ( is_ascii_string(data->strval, len) )
             {
-                write_string(bplist_buff, data->strval, data->length);
+                write_string(bplist_buff, data->strval);
             }
             else
             {
-                write_unicode(bplist_buff, data->strval, data->length);
+                unicodestr = plist_utf8_to_utf16(data->strval, len, &items_read, &items_written);
+                write_unicode(bplist_buff, unicodestr, items_written);
+                free(unicodestr);
             }
             break;
         case PLIST_DATA:
             write_data(bplist_buff, data->buff, data->length);
             break;
         case PLIST_ARRAY:
-            write_array(bplist_buff, ptr_array_index(objects, i), ref_table, ref_size);
+            write_array(bplist_buff, (node_t*)ptr_array_index(objects, i), ref_table, ref_size);
             break;
         case PLIST_DICT:
-            write_dict(bplist_buff, ptr_array_index(objects, i), ref_table, ref_size);
+            write_dict(bplist_buff, (node_t*)ptr_array_index(objects, i), ref_table, ref_size);
             break;
         case PLIST_DATE:
             write_date(bplist_buff, data->realval);
@@ -1294,9 +1370,14 @@ PLIST_API void plist_to_bin(plist_t plist, char **plist_bin, uint32_t * length)
     byte_array_append(bplist_buff, &trailer, sizeof(bplist_trailer_t));
 
     //set output buffer and size
-    *plist_bin = bplist_buff->data;
+    *plist_bin = (char*)bplist_buff->data;
     *length = bplist_buff->len;
 
     bplist_buff->data = NULL; // make sure we don't free the output buffer
     byte_array_free(bplist_buff);
+}
+
+PLIST_API void plist_to_bin_free(char **plist_bin)
+{
+    free(plist_bin);
 }
